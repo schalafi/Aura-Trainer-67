@@ -17,10 +17,13 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = REPO_ROOT / "data" / "dances"
 MODELS_DIR = Path(__file__).resolve().parent / "models"
-MODEL_PATH = MODELS_DIR / "pose_landmarker_lite.task"
+# "full" (vs. "lite"): better accuracy, still fast enough for an offline
+# extraction job. "heavy" is a one-line swap (change both constants below) if
+# even more accuracy is wanted at the cost of extraction time.
+MODEL_PATH = MODELS_DIR / "pose_landmarker_full.task"
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
-    "pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
+    "pose_landmarker_full/float16/1/pose_landmarker_full.task"
 )
 
 # Indices into MediaPipe's 33-point pose landmark list.
@@ -89,24 +92,36 @@ def make_landmarker(model_path: Path, delegate_cpu: bool = True):
     return mp_vision.PoseLandmarker.create_from_options(options)
 
 
-def extract_keypoints(
+class _Landmark:
+    """Minimal stand-in for MediaPipe's landmark objects (just the x/y/z/
+    visibility attributes normalize_landmarks() and draw_pose_overlay() read),
+    so smoothed values can flow through the same code paths as raw ones."""
+
+    __slots__ = ("x", "y", "z", "visibility")
+
+    def __init__(self, x: float, y: float, z: float, visibility: float = 1.0):
+        self.x = x
+        self.y = y
+        self.z = z
+        self.visibility = visibility
+
+
+# (frame_idx, relative_t, raw_landmarks_or_None) in frame order.
+IndexedLandmarks = list
+
+
+def detect_landmarks(
     video_path: Path,
     model_path: Path,
     start_seconds: float = 0.0,
     end_seconds: float | None = None,
-    on_frame=None,
-) -> tuple[list[dict], float]:
-    """Run pose detection over [start_seconds, end_seconds] of video_path.
-
-    Output frame timestamps are relative to start_seconds (i.e. the first
-    processed frame is always t=0), regardless of where in the source file
-    that window falls -- this lets it work identically whether video_path is
-    a pre-trimmed download (start_seconds=0) or a full local file
-    (start_seconds/end_seconds are absolute offsets into that file).
-
-    If on_frame is given, it's called as on_frame(bgr_frame, landmarks_or_None)
-    for every processed frame -- used to build a debug overlay video without
-    a second pass over the source.
+) -> tuple[IndexedLandmarks, float]:
+    """Pass 1: run pose detection over [start_seconds, end_seconds] of
+    video_path. Returns (indexed, fps) where indexed has one entry per
+    processed frame -- (frame_idx, relative_t, raw_landmarks_or_None),
+    frame_idx starting at 0 for the first processed frame and relative_t
+    relative to start_seconds (so the first processed frame is t=0)
+    regardless of where in the source file that window falls.
     """
     import cv2
     import mediapipe as mp
@@ -116,7 +131,7 @@ def extract_keypoints(
     if start_seconds:
         cap.set(cv2.CAP_PROP_POS_MSEC, start_seconds * 1000)
 
-    frames: list[dict] = []
+    indexed: IndexedLandmarks = []
     with make_landmarker(model_path) as landmarker:
         frame_idx = 0
         while True:
@@ -134,16 +149,118 @@ def extract_keypoints(
             result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
             raw_landmarks = result.pose_landmarks[0] if result.pose_landmarks else None
-            if raw_landmarks:
-                frames.append({"t": relative_t, "landmarks": normalize_landmarks(raw_landmarks)})
-
-            if on_frame is not None:
-                on_frame(frame, raw_landmarks)
-
+            indexed.append((frame_idx, relative_t, raw_landmarks))
             frame_idx += 1
 
     cap.release()
-    return frames, fps
+    return indexed, fps
+
+
+def smooth_landmark_sequence(
+    indexed: IndexedLandmarks, window_length: int = 7, polyorder: int = 2
+) -> IndexedLandmarks:
+    """Reduce per-frame jitter with a Savitzky-Golay filter applied per
+    landmark, per x/y/z axis, across the timeline -- standard technique for
+    smoothing noisy pose/hand-tracking sequences. Since extraction is
+    offline (the whole clip is already in memory), a global/non-causal
+    filter over the full sequence gives cleaner results than a real-time
+    filter would.
+
+    Frames with no detection are left as None. Detected frames are treated
+    as one contiguous sequence for smoothing purposes (ignoring any gaps
+    from brief dropouts) -- an acceptable approximation as long as dropouts
+    are rare. Falls back to returning the input unchanged if there aren't
+    enough detected frames to fill one smoothing window.
+    """
+    import numpy as np
+    from scipy.signal import savgol_filter
+
+    detected = [(i, t, lm) for i, t, lm in indexed if lm is not None]
+    if len(detected) < window_length:
+        return indexed
+
+    n_landmarks = len(detected[0][2])
+    coords = np.array(
+        [[[lm.x, lm.y, lm.z] for lm in landmarks] for _, _, landmarks in detected]
+    )  # shape: (n_detected_frames, n_landmarks, 3)
+    visibilities = [
+        [getattr(lm, "visibility", 1.0) for lm in landmarks] for _, _, landmarks in detected
+    ]
+
+    wl = window_length if window_length % 2 == 1 else window_length + 1
+    po = min(polyorder, wl - 1)
+    smoothed = savgol_filter(coords, window_length=wl, polyorder=po, axis=0)
+
+    smoothed_by_frame_idx = {
+        frame_idx: [
+            _Landmark(
+                x=float(smoothed[row, j, 0]),
+                y=float(smoothed[row, j, 1]),
+                z=float(smoothed[row, j, 2]),
+                visibility=visibilities[row][j],
+            )
+            for j in range(n_landmarks)
+        ]
+        for row, (frame_idx, _, _) in enumerate(detected)
+    }
+
+    return [(i, t, smoothed_by_frame_idx.get(i)) for i, t, _ in indexed]
+
+
+def build_output_frames(indexed: IndexedLandmarks) -> list[dict]:
+    """Convert detected (+ optionally smoothed) landmarks into the exported
+    JSON shape, dropping frames with no detection."""
+    return [
+        {"t": t, "landmarks": normalize_landmarks(lm)} for _, t, lm in indexed if lm is not None
+    ]
+
+
+def extract_keypoints(
+    video_path: Path,
+    model_path: Path,
+    start_seconds: float = 0.0,
+    end_seconds: float | None = None,
+    smooth: bool = True,
+) -> tuple[list[dict], float]:
+    """Convenience wrapper: detect landmarks, optionally smooth them, and
+    build the exported frame list -- used by the simple local-CLI path,
+    which doesn't need a debug overlay video."""
+    indexed, fps = detect_landmarks(video_path, model_path, start_seconds, end_seconds)
+    if smooth:
+        indexed = smooth_landmark_sequence(indexed)
+    return build_output_frames(indexed), fps
+
+
+def render_overlay_video(
+    video_path: Path, indexed: IndexedLandmarks, fps: float, out_path: Path, start_seconds: float = 0.0
+) -> None:
+    """Pass 2: re-read video_path and draw the (already smoothed) landmarks
+    matching each frame_idx onto it, writing an mp4 to out_path. `indexed`
+    must use the same frame indexing detect_landmarks() produced."""
+    import cv2
+
+    cap = cv2.VideoCapture(str(video_path))
+    if start_seconds:
+        cap.set(cv2.CAP_PROP_POS_MSEC, start_seconds * 1000)
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+
+    by_frame_idx = {frame_idx: lm for frame_idx, _, lm in indexed}
+    max_idx = indexed[-1][0] if indexed else -1
+    try:
+        frame_idx = 0
+        while frame_idx <= max_idx:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            draw_pose_overlay(frame, by_frame_idx.get(frame_idx))
+            writer.write(frame)
+            frame_idx += 1
+    finally:
+        writer.release()
+        cap.release()
 
 
 def draw_pose_overlay(frame, raw_landmarks) -> None:

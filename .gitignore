@@ -12,6 +12,7 @@ venv/
 
 # Reference video extraction scratch space (never commit raw video)
 tools/tmp/
+tools/models/
 clips/
 *.mp4
 *.webm

@@ -76,7 +76,7 @@ image = (
         "libxrender1",
         "libgomp1",
     )
-    .pip_install("mediapipe>=0.10.14", "opencv-python-headless", "numpy")
+    .pip_install("mediapipe>=0.10.14", "opencv-python-headless", "numpy", "scipy")
     # copy=True: _bake_model (a build step below) needs to import pose_extraction,
     # so it must be copied into the image layer now rather than mounted at
     # container startup (Modal's default for add_local_* when it's the last step).
@@ -87,11 +87,10 @@ image = (
 app = modal.App("aura-trainer-extract", image=image)
 
 
-@app.function(timeout=600)
+@app.function(timeout=900)
 def extract_and_overlay(video_bytes: bytes, start: float, end: float) -> dict:
     import tempfile
 
-    import cv2
     import pose_extraction
 
     model_path = pose_extraction.ensure_model()
@@ -101,29 +100,24 @@ def extract_and_overlay(video_bytes: bytes, start: float, end: float) -> dict:
         in_path.write_bytes(video_bytes)
         out_path = Path(tmp) / "overlay.mp4"
 
-        probe = cv2.VideoCapture(str(in_path))
-        fps = probe.get(cv2.CAP_PROP_FPS) or 30.0
-        width = int(probe.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        probe.release()
+        # Pass 1: detect raw landmarks over every frame in [start, end].
+        indexed, fps = pose_extraction.detect_landmarks(
+            in_path, model_path, start_seconds=start, end_seconds=end
+        )
+        # Smooth over the whole timeline (reduces per-frame jitter) before
+        # both exporting the JSON and drawing the debug overlay, so the
+        # overlay video actually reflects what gets saved.
+        indexed = pose_extraction.smooth_landmark_sequence(indexed)
 
-        writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-        try:
-            def on_frame(frame, raw_landmarks):
-                pose_extraction.draw_pose_overlay(frame, raw_landmarks)
-                writer.write(frame)
-
-            frames, detected_fps = pose_extraction.extract_keypoints(
-                in_path, model_path, start_seconds=start, end_seconds=end, on_frame=on_frame
-            )
-        finally:
-            writer.release()
+        frames = pose_extraction.build_output_frames(indexed)
+        # Pass 2: re-read the video and draw the smoothed skeleton per frame.
+        pose_extraction.render_overlay_video(in_path, indexed, fps, out_path, start_seconds=start)
 
         overlay_bytes = out_path.read_bytes()
 
     duration = frames[-1]["t"] if frames else 0.0
     return {
-        "fps": detected_fps,
+        "fps": fps,
         "duration": duration,
         "frames": frames,
         "overlay_mp4": overlay_bytes,
