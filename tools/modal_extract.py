@@ -57,6 +57,10 @@ def _bake_model():
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
+    # libgl1/libglib2.0-0: mediapipe's bundled OpenCV components dynamically
+    # link against libGL even though we use opencv-python-headless ourselves;
+    # Debian's slim image doesn't ship it by default.
+    .apt_install("libgl1", "libglib2.0-0")
     .pip_install("mediapipe>=0.10.14", "opencv-python-headless", "numpy")
     # copy=True: _bake_model (a build step below) needs to import pose_extraction,
     # so it must be copied into the image layer now rather than mounted at
