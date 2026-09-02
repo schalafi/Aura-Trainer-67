@@ -1,3 +1,4 @@
 yt-dlp>=2024.10.0
 mediapipe>=0.10.14
 opencv-python>=4.10
+modal>=0.68

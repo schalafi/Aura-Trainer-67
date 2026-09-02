@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Extract a reference pose-keypoint sequence from a YouTube clip.
+"""Extract a reference pose-keypoint sequence from a YouTube clip, locally.
 
 This is a one-time, offline developer tool: it downloads a short section of a
 YouTube video *transiently* (to a temp directory), runs MediaPipe's Pose
 Landmarker over every frame, writes out only the derived numeric keypoints as
 JSON, and deletes the downloaded video afterward. The raw video is never
 committed to the repo or served by the app -- only this small JSON file is.
+
+NOTE: if YouTube extraction or local MediaPipe inference is unreliable in
+your environment (bot/PO-token checks, GPU-delegate crashes, etc.), prefer
+`tools/modal_extract.py`, which runs the same extraction in a Modal cloud
+container instead of on your machine.
 
 Usage (via yt-dlp):
     python tools/extract_reference_pose.py \\
@@ -14,8 +19,7 @@ Usage (via yt-dlp):
         --slug howard_the_alien \\
         --title "Howard the Alien"
 
-Usage (from an already-downloaded local file, e.g. if yt-dlp is blocked by
-YouTube's bot/PO-token checks in your environment):
+Usage (from an already-downloaded local file):
     python tools/extract_reference_pose.py \\
         --local-file ~/Downloads/howard_the_alien.mp4 \\
         --start 0 --end 30 \\
@@ -31,34 +35,16 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
-import sys
 import tempfile
-import urllib.request
 from pathlib import Path
 
-import cv2
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = REPO_ROOT / "data" / "dances"
-MODELS_DIR = Path(__file__).resolve().parent / "models"
-MODEL_PATH = MODELS_DIR / "pose_landmarker_lite.task"
-MODEL_URL = (
-    "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
-    "pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
+from pose_extraction import (
+    DATA_DIR,
+    ensure_model,
+    extract_keypoints,
+    extract_youtube_id,
+    update_dance_index,
 )
-
-# Indices into MediaPipe's 33-point pose landmark list.
-LEFT_HIP, RIGHT_HIP = 23, 24
-LEFT_SHOULDER, RIGHT_SHOULDER = 11, 12
-
-
-def ensure_model() -> Path:
-    if MODEL_PATH.exists():
-        return MODEL_PATH
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"Downloading pose landmarker model to {MODEL_PATH} ...", file=sys.stderr)
-    urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
-    return MODEL_PATH
 
 
 def download_clip(
@@ -102,107 +88,6 @@ def download_clip(
     if not candidates:
         raise RuntimeError("yt-dlp did not produce an output file")
     return candidates[0]
-
-
-def normalize_landmarks(landmarks) -> list[dict]:
-    """Hip-center origin, torso-length scale -- makes scoring robust to the
-    user's distance from the camera and body proportions."""
-    hip_x = (landmarks[LEFT_HIP].x + landmarks[RIGHT_HIP].x) / 2
-    hip_y = (landmarks[LEFT_HIP].y + landmarks[RIGHT_HIP].y) / 2
-    shoulder_x = (landmarks[LEFT_SHOULDER].x + landmarks[RIGHT_SHOULDER].x) / 2
-    shoulder_y = (landmarks[LEFT_SHOULDER].y + landmarks[RIGHT_SHOULDER].y) / 2
-    torso = max(((shoulder_x - hip_x) ** 2 + (shoulder_y - hip_y) ** 2) ** 0.5, 1e-6)
-
-    return [
-        {
-            "x": (lm.x - hip_x) / torso,
-            "y": (lm.y - hip_y) / torso,
-            "z": lm.z / torso,
-            "visibility": getattr(lm, "visibility", 1.0),
-        }
-        for lm in landmarks
-    ]
-
-
-def extract_keypoints(
-    video_path: Path,
-    model_path: Path,
-    start_seconds: float = 0.0,
-    end_seconds: float | None = None,
-) -> tuple[list[dict], float]:
-    """Run pose detection over [start_seconds, end_seconds] of video_path.
-
-    Output frame timestamps are relative to start_seconds (i.e. the first
-    processed frame is always t=0), regardless of where in the source file
-    that window falls -- this lets it work identically whether video_path is
-    a pre-trimmed yt-dlp download (start_seconds=0) or a full local file
-    (start_seconds/end_seconds are absolute offsets into that file).
-    """
-    import mediapipe as mp
-    from mediapipe.tasks import python as mp_python
-    from mediapipe.tasks.python import vision as mp_vision
-
-    cap = cv2.VideoCapture(str(video_path))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    if start_seconds:
-        cap.set(cv2.CAP_PROP_POS_MSEC, start_seconds * 1000)
-
-    options = mp_vision.PoseLandmarkerOptions(
-        base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
-        running_mode=mp_vision.RunningMode.VIDEO,
-    )
-
-    frames: list[dict] = []
-    with mp_vision.PoseLandmarker.create_from_options(options) as landmarker:
-        frame_idx = 0
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            relative_t = frame_idx / fps
-            absolute_t = start_seconds + relative_t
-            if end_seconds is not None and absolute_t > end_seconds:
-                break
-
-            timestamp_ms = int(absolute_t * 1000)
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            result = landmarker.detect_for_video(mp_image, timestamp_ms)
-
-            if result.pose_landmarks:
-                landmarks = normalize_landmarks(result.pose_landmarks[0])
-                frames.append({"t": relative_t, "landmarks": landmarks})
-
-            frame_idx += 1
-
-    cap.release()
-    return frames, fps
-
-
-def update_dance_index(slug: str, title: str, youtube_id: str, start: float, end: float) -> None:
-    index_path = DATA_DIR / "dances.json"
-    index = json.loads(index_path.read_text()) if index_path.exists() else []
-    index = [d for d in index if d["slug"] != slug]
-    index.append(
-        {
-            "slug": slug,
-            "title": title,
-            "youtube_id": youtube_id,
-            "start_seconds": start,
-            "end_seconds": end,
-            "keypoints_file": f"{slug}.json",
-        }
-    )
-    index_path.write_text(json.dumps(index, indent=2) + "\n")
-
-
-def extract_youtube_id(url: str) -> str:
-    import re
-
-    match = re.search(r"(?:v=|youtu\.be/|embed/)([A-Za-z0-9_-]{11})", url)
-    if not match:
-        raise ValueError(f"Could not extract a YouTube video ID from: {url}")
-    return match.group(1)
 
 
 def main() -> None:
