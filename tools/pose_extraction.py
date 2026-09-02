@@ -235,18 +235,18 @@ def render_overlay_video(
     video_path: Path, indexed: IndexedLandmarks, fps: float, out_path: Path, start_seconds: float = 0.0
 ) -> None:
     """Pass 2: re-read video_path and draw the (already smoothed) landmarks
-    matching each frame_idx onto it, writing to out_path. `indexed` must use
-    the same frame indexing detect_landmarks() produced.
+    matching each frame_idx onto it, writing a proper H.264 .mp4 to out_path.
+    `indexed` must use the same frame indexing detect_landmarks() produced.
 
-    Uses MJPG/.avi rather than mp4v/.mp4: OpenCV's built-in mp4v encoder is
-    not a real H.264 implementation and produces visibly corrupted output in
-    minimal Linux containers without a full ffmpeg backend (it degrades into
-    exactly the kind of macroblock/color-noise glitching this function used
-    to produce). MJPG in an .avi container is OpenCV's own reliable
-    fallback -- larger file, but this is just a debug/QA video, not a
-    deliverable, so quality/size don't matter. out_path's suffix should be
-    .avi.
+    Encodes via the `ffmpeg` CLI (piping raw BGR24 frames over stdin) rather
+    than OpenCV's built-in VideoWriter: OpenCV's mp4v fourcc isn't a real
+    H.264 implementation and produces visibly corrupted (glitching,
+    degrading) output in minimal Linux containers without a full ffmpeg
+    backend. `ffmpeg` + libx264 gives a normal, small, widely-compatible
+    mp4 instead. Requires the `ffmpeg` binary on PATH (apt package `ffmpeg`).
     """
+    import subprocess
+
     import cv2
 
     cap = cv2.VideoCapture(str(video_path))
@@ -255,10 +255,18 @@ def render_overlay_video(
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"MJPG"), fps, (width, height))
-    if not writer.isOpened():
-        cap.release()
-        raise RuntimeError(f"Failed to open video writer for {out_path}")
+
+    ffmpeg_cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-f", "rawvideo", "-pixel_format", "bgr24",
+        "-video_size", f"{width}x{height}", "-framerate", str(fps),
+        "-i", "-",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        str(out_path),
+    ]
+    proc = subprocess.Popen(
+        ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+    )
 
     by_frame_idx = {frame_idx: lm for frame_idx, _, lm in indexed}
     max_idx = indexed[-1][0] if indexed else -1
@@ -269,11 +277,17 @@ def render_overlay_video(
             if not ok:
                 break
             draw_pose_overlay(frame, by_frame_idx.get(frame_idx))
-            writer.write(frame)
+            proc.stdin.write(frame.tobytes())
             frame_idx += 1
     finally:
-        writer.release()
         cap.release()
+        proc.stdin.close()
+        stderr_output = proc.stderr.read()
+        returncode = proc.wait()
+        if returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg failed (exit {returncode}): {stderr_output.decode(errors='replace')}"
+            )
 
 
 def draw_pose_overlay(frame, raw_landmarks) -> None:
