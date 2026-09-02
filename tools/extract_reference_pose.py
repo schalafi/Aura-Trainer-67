@@ -7,15 +7,23 @@ Landmarker over every frame, writes out only the derived numeric keypoints as
 JSON, and deletes the downloaded video afterward. The raw video is never
 committed to the repo or served by the app -- only this small JSON file is.
 
-Usage:
+Usage (via yt-dlp):
     python tools/extract_reference_pose.py \\
         --url https://youtu.be/WxrQ3SqSt6Q \\
         --start 12.5 --end 42.0 \\
         --slug howard_the_alien \\
         --title "Howard the Alien"
 
+Usage (from an already-downloaded local file, e.g. if yt-dlp is blocked by
+YouTube's bot/PO-token checks in your environment):
+    python tools/extract_reference_pose.py \\
+        --local-file ~/Downloads/howard_the_alien.mp4 \\
+        --start 0 --end 30 \\
+        --slug howard_the_alien \\
+        --title "Howard the Alien"
+
 Requires `yt-dlp`, `opencv-python`, and `mediapipe` (see tools/requirements.txt)
-plus `ffmpeg` on PATH for precise section downloads.
+plus `ffmpeg` on PATH for precise section downloads (yt-dlp path only).
 """
 
 from __future__ import annotations
@@ -116,13 +124,28 @@ def normalize_landmarks(landmarks) -> list[dict]:
     ]
 
 
-def extract_keypoints(video_path: Path, model_path: Path) -> tuple[list[dict], float]:
+def extract_keypoints(
+    video_path: Path,
+    model_path: Path,
+    start_seconds: float = 0.0,
+    end_seconds: float | None = None,
+) -> tuple[list[dict], float]:
+    """Run pose detection over [start_seconds, end_seconds] of video_path.
+
+    Output frame timestamps are relative to start_seconds (i.e. the first
+    processed frame is always t=0), regardless of where in the source file
+    that window falls -- this lets it work identically whether video_path is
+    a pre-trimmed yt-dlp download (start_seconds=0) or a full local file
+    (start_seconds/end_seconds are absolute offsets into that file).
+    """
     import mediapipe as mp
     from mediapipe.tasks import python as mp_python
     from mediapipe.tasks.python import vision as mp_vision
 
     cap = cv2.VideoCapture(str(video_path))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    if start_seconds:
+        cap.set(cv2.CAP_PROP_POS_MSEC, start_seconds * 1000)
 
     options = mp_vision.PoseLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
@@ -136,14 +159,19 @@ def extract_keypoints(video_path: Path, model_path: Path) -> tuple[list[dict], f
             ok, frame = cap.read()
             if not ok:
                 break
-            timestamp_ms = int((frame_idx / fps) * 1000)
+            relative_t = frame_idx / fps
+            absolute_t = start_seconds + relative_t
+            if end_seconds is not None and absolute_t > end_seconds:
+                break
+
+            timestamp_ms = int(absolute_t * 1000)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
             if result.pose_landmarks:
                 landmarks = normalize_landmarks(result.pose_landmarks[0])
-                frames.append({"t": frame_idx / fps, "landmarks": landmarks})
+                frames.append({"t": relative_t, "landmarks": landmarks})
 
             frame_idx += 1
 
@@ -179,7 +207,20 @@ def extract_youtube_id(url: str) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--url", required=True, help="YouTube URL of the reference clip")
+    parser.add_argument(
+        "--url", default=None, help="YouTube URL of the reference clip (omit if using --local-file)"
+    )
+    parser.add_argument(
+        "--local-file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Use an already-downloaded local video file instead of fetching via yt-dlp "
+            "(e.g. if YouTube extraction is blocked). --start/--end are absolute offsets "
+            "into this file. Only pose keypoints are extracted; the file itself is never "
+            "copied into the repo."
+        ),
+    )
     parser.add_argument("--start", type=float, required=True, help="Section start, seconds")
     parser.add_argument("--end", type=float, required=True, help="Section end, seconds")
     parser.add_argument("--slug", required=True, help="Short id, e.g. howard_the_alien")
@@ -201,24 +242,37 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if not args.local_file and not args.url:
+        parser.error("one of --url or --local-file is required")
+
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     model_path = ensure_model()
-    youtube_id = extract_youtube_id(args.url)
+    youtube_id = extract_youtube_id(args.url) if args.url else ""
 
-    tmp_dir = Path(tempfile.mkdtemp(prefix="aura-extract-"))
+    tmp_dir = Path(tempfile.mkdtemp(prefix="aura-extract-")) if not args.local_file else None
     try:
-        print(f"Downloading section [{args.start}, {args.end}]s from {args.url} ...")
-        video_path = download_clip(
-            args.url,
-            args.start,
-            args.end,
-            tmp_dir,
-            args.cookies_from_browser,
-            args.youtube_player_client,
-        )
+        if args.local_file:
+            video_path = Path(args.local_file).expanduser().resolve()
+            if not video_path.exists():
+                raise FileNotFoundError(f"--local-file not found: {video_path}")
+            print(f"Reading local file {video_path}, section [{args.start}, {args.end}]s ...")
+            print("Running pose landmarker over extracted frames ...")
+            frames, fps = extract_keypoints(
+                video_path, model_path, start_seconds=args.start, end_seconds=args.end
+            )
+        else:
+            print(f"Downloading section [{args.start}, {args.end}]s from {args.url} ...")
+            video_path = download_clip(
+                args.url,
+                args.start,
+                args.end,
+                tmp_dir,
+                args.cookies_from_browser,
+                args.youtube_player_client,
+            )
+            print("Running pose landmarker over extracted frames ...")
+            frames, fps = extract_keypoints(video_path, model_path)
 
-        print("Running pose landmarker over extracted frames ...")
-        frames, fps = extract_keypoints(video_path, model_path)
         if not frames:
             raise RuntimeError("No pose detected in any frame of the clip")
 
@@ -233,7 +287,8 @@ def main() -> None:
         print(f"Updated {DATA_DIR / 'dances.json'}")
     finally:
         # Never keep the downloaded video around -- only derived keypoints are committed.
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        if tmp_dir is not None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
