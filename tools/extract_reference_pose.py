@@ -54,7 +54,12 @@ def ensure_model() -> Path:
 
 
 def download_clip(
-    url: str, start: float, end: float, out_dir: Path, cookies_from_browser: str | None = None
+    url: str,
+    start: float,
+    end: float,
+    out_dir: Path,
+    cookies_from_browser: str | None = None,
+    youtube_player_client: str | None = None,
 ) -> Path:
     """Download only the [start, end] section of the video into out_dir."""
     import yt_dlp
@@ -74,6 +79,14 @@ def download_clip(
         # never leave the local machine -- yt-dlp reads them directly from the
         # browser's local cookie store. See yt-dlp's --cookies-from-browser docs.
         ydl_opts["cookiesfrombrowser"] = (cookies_from_browser,)
+    if youtube_player_client:
+        # Escape hatch for YouTube extractor breakage (e.g. the "SABR-only
+        # streaming experiment" / "page needs to be reloaded" errors) -- lets
+        # you force yt-dlp to use a specific player client, equivalent to its
+        # own --extractor-args "youtube:player_client=..." flag.
+        ydl_opts["extractor_args"] = {
+            "youtube": {"player_client": youtube_player_client.split(",")}
+        }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
@@ -177,6 +190,15 @@ def main() -> None:
         metavar="BROWSER",
         help="Pass browser cookies to yt-dlp to bypass YouTube bot-checks, e.g. firefox, chrome",
     )
+    parser.add_argument(
+        "--youtube-player-client",
+        default=None,
+        metavar="CLIENT[,CLIENT...]",
+        help=(
+            "Override yt-dlp's YouTube player client selection if extraction fails with "
+            "'SABR-only streaming' / 'page needs to be reloaded' errors, e.g. tv or tv,web"
+        ),
+    )
     args = parser.parse_args()
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -187,7 +209,12 @@ def main() -> None:
     try:
         print(f"Downloading section [{args.start}, {args.end}]s from {args.url} ...")
         video_path = download_clip(
-            args.url, args.start, args.end, tmp_dir, args.cookies_from_browser
+            args.url,
+            args.start,
+            args.end,
+            tmp_dir,
+            args.cookies_from_browser,
+            args.youtube_player_client,
         )
 
         print("Running pose landmarker over extracted frames ...")
