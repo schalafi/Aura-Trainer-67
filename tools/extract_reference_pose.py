@@ -53,11 +53,12 @@ def ensure_model() -> Path:
     return MODEL_PATH
 
 
-def download_clip(url: str, start: float, end: float, out_dir: Path) -> Path:
+def download_clip(
+    url: str, start: float, end: float, out_dir: Path, cookies_from_browser: str | None = None
+) -> Path:
     """Download only the [start, end] section of the video into out_dir."""
     import yt_dlp
 
-    section = f"*{start}-{end}"
     out_template = str(out_dir / "clip.%(ext)s")
     ydl_opts = {
         "format": "bestvideo[ext=mp4]/mp4/best",
@@ -67,6 +68,12 @@ def download_clip(url: str, start: float, end: float, out_dir: Path) -> Path:
         "quiet": False,
         "noplaylist": True,
     }
+    if cookies_from_browser:
+        # Lets yt-dlp reuse cookies from a local browser profile to get past
+        # YouTube's bot-check ("Sign in to confirm you're not a bot"). Cookies
+        # never leave the local machine -- yt-dlp reads them directly from the
+        # browser's local cookie store. See yt-dlp's --cookies-from-browser docs.
+        ydl_opts["cookiesfrombrowser"] = (cookies_from_browser,)
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
@@ -164,6 +171,12 @@ def main() -> None:
     parser.add_argument("--end", type=float, required=True, help="Section end, seconds")
     parser.add_argument("--slug", required=True, help="Short id, e.g. howard_the_alien")
     parser.add_argument("--title", required=True, help="Display name, e.g. 'Howard the Alien'")
+    parser.add_argument(
+        "--cookies-from-browser",
+        default=None,
+        metavar="BROWSER",
+        help="Pass browser cookies to yt-dlp to bypass YouTube bot-checks, e.g. firefox, chrome",
+    )
     args = parser.parse_args()
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -173,7 +186,9 @@ def main() -> None:
     tmp_dir = Path(tempfile.mkdtemp(prefix="aura-extract-"))
     try:
         print(f"Downloading section [{args.start}, {args.end}]s from {args.url} ...")
-        video_path = download_clip(args.url, args.start, args.end, tmp_dir)
+        video_path = download_clip(
+            args.url, args.start, args.end, tmp_dir, args.cookies_from_browser
+        )
 
         print("Running pose landmarker over extracted frames ...")
         frames, fps = extract_keypoints(video_path, model_path)
