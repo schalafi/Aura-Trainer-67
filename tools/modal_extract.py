@@ -28,9 +28,12 @@ extraction there, and:
     clips/<slug>_pose_overlay.mp4 (gitignored) so you can eyeball detection
     quality before it's wired into the app
 
-Note: Modal's function argument/return payload limit is ~100MB, comfortably
-enough for a 30s clip at reasonable resolution. A much longer/higher-res
-reference clip would need a modal.Volume instead of passing bytes inline.
+Note: Modal automatically routes function argument/return payloads over 2MiB
+through its blob storage rather than the direct RPC path, transparently --
+no special handling needed here. That's the documented pattern for passing
+local files to a remote function (read bytes, pass as an argument). A
+future dataset-scale need (hundreds of clips, huge files) would call for a
+modal.Volume instead, but a single 30s clip doesn't.
 """
 
 from __future__ import annotations
