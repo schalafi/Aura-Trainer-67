@@ -58,7 +58,10 @@ def _bake_model():
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("mediapipe>=0.10.14", "opencv-python-headless", "numpy")
-    .add_local_python_source("pose_extraction")
+    # copy=True: _bake_model (a build step below) needs to import pose_extraction,
+    # so it must be copied into the image layer now rather than mounted at
+    # container startup (Modal's default for add_local_* when it's the last step).
+    .add_local_python_source("pose_extraction", copy=True)
     .run_function(_bake_model)
 )
 
