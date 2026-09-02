@@ -235,8 +235,18 @@ def render_overlay_video(
     video_path: Path, indexed: IndexedLandmarks, fps: float, out_path: Path, start_seconds: float = 0.0
 ) -> None:
     """Pass 2: re-read video_path and draw the (already smoothed) landmarks
-    matching each frame_idx onto it, writing an mp4 to out_path. `indexed`
-    must use the same frame indexing detect_landmarks() produced."""
+    matching each frame_idx onto it, writing to out_path. `indexed` must use
+    the same frame indexing detect_landmarks() produced.
+
+    Uses MJPG/.avi rather than mp4v/.mp4: OpenCV's built-in mp4v encoder is
+    not a real H.264 implementation and produces visibly corrupted output in
+    minimal Linux containers without a full ffmpeg backend (it degrades into
+    exactly the kind of macroblock/color-noise glitching this function used
+    to produce). MJPG in an .avi container is OpenCV's own reliable
+    fallback -- larger file, but this is just a debug/QA video, not a
+    deliverable, so quality/size don't matter. out_path's suffix should be
+    .avi.
+    """
     import cv2
 
     cap = cv2.VideoCapture(str(video_path))
@@ -245,7 +255,10 @@ def render_overlay_video(
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"MJPG"), fps, (width, height))
+    if not writer.isOpened():
+        cap.release()
+        raise RuntimeError(f"Failed to open video writer for {out_path}")
 
     by_frame_idx = {frame_idx: lm for frame_idx, _, lm in indexed}
     max_idx = indexed[-1][0] if indexed else -1

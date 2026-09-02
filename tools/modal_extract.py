@@ -25,8 +25,9 @@ is kept remotely afterward -- the function is stateless), runs pose
 extraction there, and:
   - writes data/dances/<slug>.json + updates data/dances/dances.json locally
   - saves a debug overlay video (skeleton drawn over the original footage) to
-    clips/<slug>_pose_overlay.mp4 (gitignored) so you can eyeball detection
-    quality before it's wired into the app
+    clips/<slug>_pose_overlay.avi (gitignored) so you can eyeball detection
+    quality before it's wired into the app -- .avi/MJPG rather than .mp4,
+    since OpenCV's mp4v encoder produces corrupted output in this container
 
 Note: Modal automatically routes function argument/return payloads over 2MiB
 through its blob storage rather than the direct RPC path, transparently --
@@ -98,7 +99,7 @@ def extract_and_overlay(video_bytes: bytes, start: float, end: float) -> dict:
     with tempfile.TemporaryDirectory() as tmp:
         in_path = Path(tmp) / "input.mp4"
         in_path.write_bytes(video_bytes)
-        out_path = Path(tmp) / "overlay.mp4"
+        out_path = Path(tmp) / "overlay.avi"
 
         # Pass 1: detect raw landmarks over every frame in [start, end].
         indexed, fps = pose_extraction.detect_landmarks(
@@ -152,6 +153,6 @@ def main(local_file: str, start: float, end: float, slug: str, title: str, youtu
     print(f"Updated {DATA_DIR / 'dances.json'}")
 
     CLIPS_DIR.mkdir(parents=True, exist_ok=True)
-    overlay_path = CLIPS_DIR / f"{slug}_pose_overlay.mp4"
+    overlay_path = CLIPS_DIR / f"{slug}_pose_overlay.avi"
     overlay_path.write_bytes(result["overlay_mp4"])
     print(f"Wrote debug pose-overlay video to {overlay_path} (not committed -- gitignored)")
