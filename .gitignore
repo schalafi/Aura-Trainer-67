@@ -1,0 +1,21 @@
+# Node / frontend
+frontend/node_modules/
+frontend/dist/*
+!frontend/dist/.gitkeep
+
+# Python / backend / tools
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Reference video extraction scratch space (never commit raw video)
+tools/tmp/
+*.mp4
+*.webm
+*.mkv
+
+# Editor / OS
+.DS_Store
+.vscode/

@@ -1,0 +1,11 @@
+[
+  {
+    "slug": "howard_the_alien",
+    "title": "Howard the Alien",
+    "youtube_id": "WxrQ3SqSt6Q",
+    "start_seconds": 0.0,
+    "end_seconds": 8.0,
+    "keypoints_file": "howard_the_alien.json",
+    "placeholder": true
+  }
+]
